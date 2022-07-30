@@ -97,7 +97,7 @@ resource "null_resource" "kustomization" {
         ],
         var.disable_hetzner_csi ? [] : ["https://raw.githubusercontent.com/hetznercloud/csi-driver/${local.csi_version}/deploy/kubernetes/hcloud-csi.yml"],
         var.traefik_enabled ? ["traefik_config.yaml"] : [],
-        var.cni_plugin == "calico" ? ["https://projectcalico.docs.tigera.io/manifests/calico.yaml"] : [],
+        var.cni_plugin == "calico" ? [var.calico_yaml] : [],
         var.enable_longhorn ? ["longhorn.yaml"] : [],
         var.enable_cert_manager || var.enable_rancher ? ["cert_manager.yaml"] : [],
         var.enable_rancher ? ["rancher.yaml"] : [],
@@ -113,6 +113,12 @@ resource "null_resource" "kustomization" {
       )
     })
     destination = "/var/post_install/kustomization.yaml"
+  }
+
+  # Upload calico manifest
+  provisioner "file" {
+    content = file("${path.module}/templates/calico_modify.yaml.tpl")
+    destination = "/var/post_install/calico_modify.yaml"
   }
 
   # Upload traefik config

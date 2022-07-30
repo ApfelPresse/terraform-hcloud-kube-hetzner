@@ -256,3 +256,9 @@ variable "block_icmp_ping_in" {
   default     = false
   description = "Block ICMP ping in"
 }
+
+variable "calico_yaml" {
+  type = string
+  default = "https://projectcalico.docs.tigera.io/manifests/calico.yaml"
+  description = "Calico yaml"
+}
