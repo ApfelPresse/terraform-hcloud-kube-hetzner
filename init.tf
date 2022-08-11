@@ -22,10 +22,11 @@ resource "null_resource" "first_control_plane" {
       node-taint                  = local.control_plane_nodes[keys(module.control_planes)[0]].taints
       node-label                  = local.control_plane_nodes[keys(module.control_planes)[0]].labels
       disable-network-policy      = var.cni_plugin == "calico" ? true : var.disable_network_policy
-      },
+      flannel-backend             = "wireguard"
+    },
       var.cni_plugin == "calico" ? {
-        flannel-backend = "none"
-    } : {}))
+        flannel-backend = "wireguard"
+      } : {}))
 
     destination = "/tmp/config.yaml"
   }
@@ -95,7 +96,9 @@ resource "null_resource" "kustomization" {
           "https://github.com/weaveworks/kured/releases/download/${local.kured_version}/kured-${local.kured_version}-dockerhub.yaml",
           "https://raw.githubusercontent.com/rancher/system-upgrade-controller/master/manifests/system-upgrade-controller.yaml",
         ],
-        var.disable_hetzner_csi ? [] : ["https://raw.githubusercontent.com/hetznercloud/csi-driver/${local.csi_version}/deploy/kubernetes/hcloud-csi.yml"],
+        var.disable_hetzner_csi ? [] : [
+          "https://raw.githubusercontent.com/hetznercloud/csi-driver/${local.csi_version}/deploy/kubernetes/hcloud-csi.yml"
+        ],
         var.traefik_enabled ? ["traefik_config.yaml"] : [],
         var.cni_plugin == "calico" ? [var.calico_yaml] : [],
         var.enable_longhorn ? ["longhorn.yaml"] : [],
@@ -117,7 +120,7 @@ resource "null_resource" "kustomization" {
 
   # Upload calico manifest
   provisioner "file" {
-    content = file("${path.module}/templates/calico_modify.yaml.tpl")
+    content     = file("${path.module}/templates/calico_modify.yaml.tpl")
     destination = "/var/post_install/calico_modify.yaml"
   }
 
@@ -134,7 +137,7 @@ resource "null_resource" "kustomization" {
         traefik_acme_email         = var.traefik_acme_email
         traefik_additional_options = var.traefik_additional_options
         using_hetzner_lb           = !local.using_klipper_lb
-    })
+      })
     destination = "/var/post_install/traefik_config.yaml"
   }
 
@@ -147,7 +150,7 @@ resource "null_resource" "kustomization" {
         allow_scheduling_on_control_plane = local.allow_scheduling_on_control_plane
         default_lb_location               = var.load_balancer_location
         using_hetzner_lb                  = !local.using_klipper_lb
-    })
+      })
     destination = "/var/post_install/ccm.yaml"
   }
 
@@ -157,7 +160,7 @@ resource "null_resource" "kustomization" {
       "${path.module}/templates/calico.yaml.tpl",
       {
         cluster_cidr_ipv4 = local.cluster_cidr_ipv4
-    })
+      })
     destination = "/var/post_install/calico.yaml"
   }
 
@@ -167,7 +170,7 @@ resource "null_resource" "kustomization" {
       "${path.module}/templates/plans.yaml.tpl",
       {
         channel = var.initial_k3s_channel
-    })
+      })
     destination = "/var/post_install/plans.yaml"
   }
 
@@ -177,7 +180,7 @@ resource "null_resource" "kustomization" {
       "${path.module}/templates/longhorn.yaml.tpl",
       {
         disable_hetzner_csi = var.disable_hetzner_csi
-    })
+      })
     destination = "/var/post_install/longhorn.yaml"
   }
 
@@ -185,7 +188,7 @@ resource "null_resource" "kustomization" {
   provisioner "file" {
     content = templatefile(
       "${path.module}/templates/cert_manager.yaml.tpl",
-    {})
+      {})
     destination = "/var/post_install/cert_manager.yaml"
   }
 
@@ -198,7 +201,7 @@ resource "null_resource" "kustomization" {
         rancher_hostname           = var.rancher_hostname
         rancher_bootstrap_password = length(var.rancher_bootstrap_password) == 0 ? resource.random_password.rancher_bootstrap[0].result : var.rancher_bootstrap_password
         number_control_plane_nodes = length(local.control_plane_nodes)
-    })
+      })
     destination = "/var/post_install/rancher.yaml"
   }
 
@@ -236,16 +239,16 @@ resource "null_resource" "kustomization" {
         done
       EOF
       EOT
-      ,
+    ,
 
       # Ready, set, go for the kustomization
       "kubectl apply -k /var/post_install",
       "echo 'Waiting for the system-upgrade-controller deployment to become available...'",
       "kubectl -n system-upgrade wait --for=condition=available --timeout=120s deployment/system-upgrade-controller",
       "kubectl -n system-upgrade apply -f /var/post_install/plans.yaml"
-      ]
-      ,
-      local.using_klipper_lb || var.traefik_enabled == false ? [] : [<<-EOT
+    ],
+      local.using_klipper_lb || var.traefik_enabled == false ? [] : [
+        <<-EOT
       timeout 120 bash <<EOF
       until [ -n "\$(kubectl get -n kube-system service/traefik --output=jsonpath='{.status.loadBalancer.ingress[0].ip}' 2> /dev/null)" ]; do
           echo "Waiting for load-balancer to get an IP..."
@@ -253,7 +256,7 @@ resource "null_resource" "kustomization" {
       done
       EOF
       EOT
-    ])
+      ])
   }
 
   depends_on = [

@@ -20,6 +20,7 @@ module "control_planes" {
   ipv4_subnet_id             = hcloud_network_subnet.control_plane[[for i, v in var.control_plane_nodepools : i if v.name == each.value.nodepool_name][0]].id
   packages_to_install        = local.packages_to_install
 
+
   # We leave some room so 100 eventual Hetzner LBs that can be created perfectly safely
   # It leaves the subnet with 254 x 254 - 100 = 64416 IPs to use, so probably enough.
   private_ipv4 = cidrhost(hcloud_network_subnet.control_plane[[for i, v in var.control_plane_nodepools : i if v.name == each.value.nodepool_name][0]].ip_range, each.value.index + 101)
@@ -65,10 +66,11 @@ resource "null_resource" "control_planes" {
       node-taint                  = each.value.taints
       disable-network-policy      = var.cni_plugin == "calico" ? true : var.disable_network_policy
       write-kubeconfig-mode       = "0644" # needed for import into rancher
-      },
+      flannel-backend             = "wireguard"
+    },
       var.cni_plugin == "calico" ? {
-        flannel-backend = "none"
-    } : {}))
+        flannel-backend = "wireguard"
+      } : {}))
 
     destination = "/tmp/config.yaml"
   }
