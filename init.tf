@@ -4,29 +4,35 @@ resource "null_resource" "first_control_plane" {
     private_key    = var.ssh_private_key
     agent_identity = local.ssh_agent_identity
     host           = module.control_planes[keys(module.control_planes)[0]].ipv4_address
+    port           = var.ssh_port
   }
 
   # Generating k3s master config file
   provisioner "file" {
-    content = yamlencode(merge({
-      node-name                   = module.control_planes[keys(module.control_planes)[0]].name
-      token                       = random_password.k3s_token.result
-      cluster-init                = true
-      disable-cloud-controller    = true
-      disable                     = local.disable_extras
-      flannel-iface               = "eth1"
-      kubelet-arg                 = ["cloud-provider=external", "volume-plugin-dir=/var/lib/kubelet/volumeplugins"]
-      kube-controller-manager-arg = "flex-volume-plugin-dir=/var/lib/kubelet/volumeplugins"
-      node-ip                     = module.control_planes[keys(module.control_planes)[0]].private_ipv4_address
-      advertise-address           = module.control_planes[keys(module.control_planes)[0]].private_ipv4_address
-      node-taint                  = local.control_plane_nodes[keys(module.control_planes)[0]].taints
-      node-label                  = local.control_plane_nodes[keys(module.control_planes)[0]].labels
-      disable-network-policy      = var.cni_plugin == "calico" ? true : var.disable_network_policy
-      flannel-backend             = "wireguard"
-    },
-      var.cni_plugin == "calico" ? {
-        flannel-backend = "wireguard"
-      } : {}))
+    content = yamlencode(
+      merge(
+        {
+          node-name                   = module.control_planes[keys(module.control_planes)[0]].name
+          token                       = random_password.k3s_token.result
+          cluster-init                = true
+          disable-cloud-controller    = true
+          disable                     = local.disable_extras
+          kubelet-arg                 = ["cloud-provider=external", "volume-plugin-dir=/var/lib/kubelet/volumeplugins"]
+          kube-controller-manager-arg = "flex-volume-plugin-dir=/var/lib/kubelet/volumeplugins"
+          flannel-iface               = "eth1"
+          node-ip                     = module.control_planes[keys(module.control_planes)[0]].private_ipv4_address
+          advertise-address           = module.control_planes[keys(module.control_planes)[0]].private_ipv4_address
+          node-taint                  = local.control_plane_nodes[keys(module.control_planes)[0]].taints
+          node-label                  = local.control_plane_nodes[keys(module.control_planes)[0]].labels
+        },
+        lookup(local.cni_k3s_settings, var.cni_plugin, {}),
+        var.use_control_plane_lb ? {
+          tls-san = [hcloud_load_balancer.control_plane.*.ipv4[0], hcloud_load_balancer_network.control_plane.*.ip[0]]
+          } : {
+          tls-san = [module.control_planes[keys(module.control_planes)[0]].ipv4_address]
+        }
+      )
+    )
 
     destination = "/tmp/config.yaml"
   }
@@ -82,6 +88,7 @@ resource "null_resource" "kustomization" {
     private_key    = var.ssh_private_key
     agent_identity = local.ssh_agent_identity
     host           = module.control_planes[keys(module.control_planes)[0]].ipv4_address
+    port           = var.ssh_port
   }
 
   # Upload kustomization.yaml, containing Hetzner CSI & CSM, as well as kured.
@@ -99,8 +106,8 @@ resource "null_resource" "kustomization" {
         var.disable_hetzner_csi ? [] : [
           "https://raw.githubusercontent.com/hetznercloud/csi-driver/${local.csi_version}/deploy/kubernetes/hcloud-csi.yml"
         ],
-        var.traefik_enabled ? ["traefik_config.yaml"] : [],
-        var.cni_plugin == "calico" ? [var.calico_yaml] : [],
+        lookup(local.ingress_controller_install_resources, local.ingress_controller, []),
+        lookup(local.cni_install_resources, var.cni_plugin, []),
         var.enable_longhorn ? ["longhorn.yaml"] : [],
         var.enable_cert_manager || var.enable_rancher ? ["cert_manager.yaml"] : [],
         var.enable_rancher ? ["rancher.yaml"] : [],
@@ -112,24 +119,18 @@ resource "null_resource" "kustomization" {
           file("${path.module}/kustomize/system-upgrade-controller.yaml"),
           "ccm.yaml",
         ],
-        var.cni_plugin == "calico" ? ["calico.yaml"] : []
+        lookup(local.cni_install_resource_patches, var.cni_plugin, [])
       )
     })
     destination = "/var/post_install/kustomization.yaml"
   }
 
-  # Upload calico manifest
-  provisioner "file" {
-    content     = file("${path.module}/templates/calico_modify.yaml.tpl")
-    destination = "/var/post_install/calico_modify.yaml"
-  }
-
   # Upload traefik config
   provisioner "file" {
-    content = local.using_klipper_lb || var.traefik_enabled == false ? "" : templatefile(
+    content = templatefile(
       "${path.module}/templates/traefik_config.yaml.tpl",
       {
-        name                       = "${var.cluster_name}-traefik"
+        name                       = var.cluster_name
         load_balancer_disable_ipv6 = var.load_balancer_disable_ipv6
         load_balancer_type         = var.load_balancer_type
         location                   = var.load_balancer_location
@@ -137,8 +138,18 @@ resource "null_resource" "kustomization" {
         traefik_acme_email         = var.traefik_acme_email
         traefik_additional_options = var.traefik_additional_options
         using_hetzner_lb           = !local.using_klipper_lb
-      })
+    })
     destination = "/var/post_install/traefik_config.yaml"
+  }
+
+  # Upload nginx ingress controller config
+  provisioner "file" {
+    content = templatefile(
+      "${path.module}/templates/nginx_ingress.yaml.tpl",
+      {
+        values = indent(4, trimspace(fileexists("nginx_ingress_values.yaml") ? file("nginx_ingress_values.yaml") : local.default_nginx_ingress_values))
+    })
+    destination = "/var/post_install/nginx_ingress.yaml"
   }
 
   # Upload the CCM patch config
@@ -146,11 +157,10 @@ resource "null_resource" "kustomization" {
     content = templatefile(
       "${path.module}/templates/ccm.yaml.tpl",
       {
-        cluster_cidr_ipv4                 = local.cluster_cidr_ipv4
-        allow_scheduling_on_control_plane = local.allow_scheduling_on_control_plane
-        default_lb_location               = var.load_balancer_location
-        using_hetzner_lb                  = !local.using_klipper_lb
-      })
+        cluster_cidr_ipv4   = local.cluster_cidr_ipv4
+        default_lb_location = var.load_balancer_location
+        using_hetzner_lb    = !local.using_klipper_lb
+    })
     destination = "/var/post_install/ccm.yaml"
   }
 
@@ -160,8 +170,18 @@ resource "null_resource" "kustomization" {
       "${path.module}/templates/calico.yaml.tpl",
       {
         cluster_cidr_ipv4 = local.cluster_cidr_ipv4
-      })
+    })
     destination = "/var/post_install/calico.yaml"
+  }
+
+  # Upload the cilium install file
+  provisioner "file" {
+    content = templatefile(
+      "${path.module}/templates/cilium.yaml.tpl",
+      {
+        values = indent(4, trimspace(fileexists("cilium_values.yaml") ? file("cilium_values.yaml") : local.default_cilium_values))
+    })
+    destination = "/var/post_install/cilium.yaml"
   }
 
   # Upload the system upgrade controller plans config
@@ -170,7 +190,7 @@ resource "null_resource" "kustomization" {
       "${path.module}/templates/plans.yaml.tpl",
       {
         channel = var.initial_k3s_channel
-      })
+    })
     destination = "/var/post_install/plans.yaml"
   }
 
@@ -179,8 +199,8 @@ resource "null_resource" "kustomization" {
     content = templatefile(
       "${path.module}/templates/longhorn.yaml.tpl",
       {
-        disable_hetzner_csi = var.disable_hetzner_csi
-      })
+        values = indent(4, trimspace(fileexists("longhorn_values.yaml") ? file("longhorn_values.yaml") : local.default_longhorn_values))
+    })
     destination = "/var/post_install/longhorn.yaml"
   }
 
@@ -188,7 +208,7 @@ resource "null_resource" "kustomization" {
   provisioner "file" {
     content = templatefile(
       "${path.module}/templates/cert_manager.yaml.tpl",
-      {})
+    {})
     destination = "/var/post_install/cert_manager.yaml"
   }
 
@@ -197,11 +217,9 @@ resource "null_resource" "kustomization" {
     content = templatefile(
       "${path.module}/templates/rancher.yaml.tpl",
       {
-        rancher_install_channel    = var.rancher_install_channel
-        rancher_hostname           = var.rancher_hostname
-        rancher_bootstrap_password = length(var.rancher_bootstrap_password) == 0 ? resource.random_password.rancher_bootstrap[0].result : var.rancher_bootstrap_password
-        number_control_plane_nodes = length(local.control_plane_nodes)
-      })
+        rancher_install_channel = var.rancher_install_channel
+        values                  = indent(4, trimspace(fileexists("rancher_values.yaml") ? file("rancher_values.yaml") : local.default_rancher_values))
+    })
     destination = "/var/post_install/rancher.yaml"
   }
 
@@ -232,36 +250,39 @@ resource "null_resource" "kustomization" {
       # Wait for k3s to become ready (we check one more time) because in some edge cases,
       # the cluster had become unvailable for a few seconds, at this very instant.
       <<-EOT
-      timeout 120 bash <<EOF
+      timeout 180 bash <<EOF
         until [[ "\$(kubectl get --raw='/readyz' 2> /dev/null)" == "ok" ]]; do
           echo "Waiting for the cluster to become ready..."
           sleep 2
         done
       EOF
       EOT
-    ,
+      ]
+      ,
 
-      # Ready, set, go for the kustomization
-      "kubectl apply -k /var/post_install",
-      "echo 'Waiting for the system-upgrade-controller deployment to become available...'",
-      "kubectl -n system-upgrade wait --for=condition=available --timeout=120s deployment/system-upgrade-controller",
-      "kubectl -n system-upgrade apply -f /var/post_install/plans.yaml"
-    ],
-      local.using_klipper_lb || var.traefik_enabled == false ? [] : [
+      [
+        # Ready, set, go for the kustomization
+        "kubectl apply -k /var/post_install",
+        "echo 'Waiting for the system-upgrade-controller deployment to become available...'",
+        "kubectl -n system-upgrade wait --for=condition=available --timeout=180s deployment/system-upgrade-controller",
+        "sleep 5", # important as the system upgrade controller CRDs sometimes don't get ready right away, especially with Cilium.
+        "kubectl -n system-upgrade apply -f /var/post_install/plans.yaml"
+      ],
+      local.has_external_load_balancer ? [] : [
         <<-EOT
-      timeout 120 bash <<EOF
-      until [ -n "\$(kubectl get -n kube-system service/traefik --output=jsonpath='{.status.loadBalancer.ingress[0].ip}' 2> /dev/null)" ]; do
+      timeout 180 bash <<EOF
+      until [ -n "\$(kubectl get -n kube-system service/${lookup(local.ingress_controller_service_names, local.ingress_controller)} --output=jsonpath='{.status.loadBalancer.ingress[0].ip}' 2> /dev/null)" ]; do
           echo "Waiting for load-balancer to get an IP..."
           sleep 2
       done
       EOF
       EOT
-      ])
+    ])
   }
 
   depends_on = [
     null_resource.first_control_plane,
-    local_sensitive_file.kubeconfig,
-    random_password.rancher_bootstrap
+    random_password.rancher_bootstrap,
+    hcloud_volume.longhorn_volume
   ]
 }

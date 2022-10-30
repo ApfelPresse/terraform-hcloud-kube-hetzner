@@ -8,6 +8,11 @@ variable "base_domain" {
   type        = string
 }
 
+variable "ssh_port" {
+  description = "SSH port"
+  type        = number
+}
+
 variable "ssh_public_key" {
   description = "SSH public Key"
   type        = string
@@ -31,7 +36,7 @@ variable "ssh_keys" {
 }
 
 variable "firewall_ids" {
-  description = "Set of firewal IDs"
+  description = "Set of firewall IDs"
   type        = set(number)
   nullable    = true
 }
@@ -72,4 +77,14 @@ variable "packages_to_install" {
   description = "Packages to install"
   type        = list(string)
   default     = []
+}
+
+variable "dns_servers" {
+  type        = list(string)
+  description = "IP Addresses to use for the DNS Servers, set to an empty list to use the ones provided by Hetzner"
+}
+
+variable "automatically_upgrade_os" {
+  type    = bool
+  default = true
 }

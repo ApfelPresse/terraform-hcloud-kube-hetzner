@@ -60,14 +60,7 @@ resource "hcloud_placement_group" "agent" {
   type  = "spread"
 }
 
-data "hcloud_load_balancer" "traefik" {
-  count = local.using_klipper_lb ? 0 : var.traefik_enabled == false ? 0 : 1
-  name  = "${var.cluster_name}-traefik"
-
-  depends_on = [null_resource.kustomization]
-}
-
-resource "null_resource" "destroy_traefik_loadbalancer" {
+resource "null_resource" "destroy_cluster_loadbalancer" {
 
   # this only gets triggered before total destruction of the cluster, but when the necessary elements to run the commands are still available
   triggers = {
@@ -83,7 +76,6 @@ resource "null_resource" "destroy_traefik_loadbalancer" {
   }
 
   depends_on = [
-    local_sensitive_file.kubeconfig,
     null_resource.control_planes[0],
     hcloud_network_subnet.control_plane,
     hcloud_network_subnet.agent,

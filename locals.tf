@@ -23,8 +23,12 @@ locals {
 
   apply_k3s_selinux = ["/sbin/semodule -v -i /usr/share/selinux/packages/k3s.pp"]
 
-  install_k3s_server = concat(local.common_commands_install_k3s, ["curl -sfL https://get.k3s.io | INSTALL_K3S_SKIP_START=true INSTALL_K3S_SKIP_SELINUX_RPM=true INSTALL_K3S_CHANNEL=${var.initial_k3s_channel} INSTALL_K3S_EXEC=server sh -"], local.apply_k3s_selinux)
-  install_k3s_agent  = concat(local.common_commands_install_k3s, ["curl -sfL https://get.k3s.io | INSTALL_K3S_SKIP_START=true INSTALL_K3S_SKIP_SELINUX_RPM=true INSTALL_K3S_CHANNEL=${var.initial_k3s_channel} INSTALL_K3S_EXEC=agent sh -"], local.apply_k3s_selinux)
+  install_k3s_server = concat(local.common_commands_install_k3s, [
+    "curl -sfL https://get.k3s.io | INSTALL_K3S_SKIP_START=true INSTALL_K3S_SKIP_SELINUX_RPM=true INSTALL_K3S_CHANNEL=${var.initial_k3s_channel} INSTALL_K3S_EXEC=server sh -"
+  ], local.apply_k3s_selinux)
+  install_k3s_agent = concat(local.common_commands_install_k3s, [
+    "curl -sfL https://get.k3s.io | INSTALL_K3S_SKIP_START=true INSTALL_K3S_SKIP_SELINUX_RPM=true INSTALL_K3S_CHANNEL=${var.initial_k3s_channel} INSTALL_K3S_EXEC=agent sh -"
+  ], local.apply_k3s_selinux)
 
   control_plane_nodes = merge([
     for pool_index, nodepool_obj in var.control_plane_nodepools : {
@@ -46,9 +50,10 @@ locals {
       format("%s-%s-%s", pool_index, node_index, nodepool_obj.name) => {
         nodepool_name : nodepool_obj.name,
         server_type : nodepool_obj.server_type,
+        longhorn_volume_size : lookup(nodepool_obj, "longhorn_volume_size", 0),
         location : nodepool_obj.location,
         labels : concat(local.default_agent_labels, nodepool_obj.labels),
-        taints : nodepool_obj.taints,
+        taints : concat(local.default_agent_taints, nodepool_obj.taints),
         index : node_index
       }
     }
@@ -66,10 +71,14 @@ locals {
   agent_count            = sum([for v in var.agent_nodepools : v.count])
   is_single_node_cluster = (local.control_plane_count + local.agent_count) == 1
 
-  using_klipper_lb = var.use_klipper_lb || local.is_single_node_cluster
+  using_klipper_lb = var.enable_klipper_metal_lb || local.is_single_node_cluster
+
+  has_external_load_balancer = local.using_klipper_lb || local.ingress_controller == "none"
 
   # disable k3s extras
-  disable_extras = concat(["local-storage"], local.using_klipper_lb ? [] : ["servicelb"], var.traefik_enabled ? [] : ["traefik"], var.metrics_server_enabled ? [] : ["metrics-server"])
+  disable_extras = concat(["local-storage"], local.using_klipper_lb ? [] : ["servicelb"], var.enable_traefik ? [] : [
+    "traefik"
+  ], var.enable_metrics_server ? [] : ["metrics-server"])
 
   # Default k3s node labels
   default_agent_labels         = concat([], var.automatically_upgrade_k3s ? ["k3s_upgrade=true"] : [])
@@ -78,9 +87,11 @@ locals {
   allow_scheduling_on_control_plane = local.is_single_node_cluster ? true : var.allow_scheduling_on_control_plane
 
   # Default k3s node taints
-  default_control_plane_taints = concat([], local.allow_scheduling_on_control_plane ? [] : ["node-role.kubernetes.io/master:NoSchedule"])
+  default_control_plane_taints = concat([], local.allow_scheduling_on_control_plane ? [] : ["node-role.kubernetes.io/control-plane:NoSchedule"])
+  default_agent_taints         = concat([], var.cni_plugin == "cilium" ? ["node.cilium.io/agent-not-ready:NoExecute"] : [])
 
-  packages_to_install = concat(var.enable_longhorn ? ["open-iscsi", "nfs-client"] : [], ["wireguard-tools"])
+
+  packages_to_install = concat(var.enable_longhorn ? ["open-iscsi", "nfs-client", "xfsprogs"] : [], var.extra_packages_to_install)
 
   # The following IPs are important to be whitelisted because they communicate with Hetzner services and enable the CCM and CSI to work properly.
   # Source https://github.com/hetznercloud/csi-driver/issues/204#issuecomment-848625566
@@ -127,11 +138,19 @@ locals {
       ]
     },
 
-    # Allow all traffic to the ssh port
+    # Allow all traffic to the ssh ports
     {
       direction = "in"
       protocol  = "tcp"
       port      = "22"
+      source_ips = [
+        "0.0.0.0/0"
+      ]
+    },
+    {
+      direction = "in"
+      protocol  = "tcp"
+      port      = var.ssh_port
       source_ips = [
         "0.0.0.0/0"
       ]
@@ -219,5 +238,109 @@ locals {
         "0.0.0.0/0"
       ]
     }
+    ], var.cni_plugin != "cilium" ? [] : [
+    {
+      direction = "in"
+      protocol  = "tcp"
+      port      = "4244-4245"
+      source_ips = [
+        "0.0.0.0/0"
+      ]
+    }
   ])
+
+  labels = {
+    "provisioner" = "terraform",
+    "engine"      = "k3s"
+    "cluster"     = var.cluster_name
+  }
+
+  labels_control_plane_node = {
+    role = "control_plane_node"
+  }
+  labels_control_plane_lb = {
+    role = "control_plane_lb"
+  }
+
+  labels_agent_node = {
+    role = "agent_node"
+  }
+
+  cni_install_resources = {
+    "calico" = ["https://projectcalico.docs.tigera.io/manifests/calico.yaml"]
+    "cilium" = ["cilium.yaml"]
+  }
+
+  cni_install_resource_patches = {
+    "calico" = ["calico.yaml"]
+  }
+
+  cni_k3s_settings = {
+    "flannel" = {
+      disable-network-policy = var.disable_network_policy
+    }
+    "calico" = {
+      disable-network-policy = true
+      flannel-backend        = "none"
+    }
+    "cilium" = {
+      disable-network-policy = true
+      flannel-backend        = "none"
+    }
+  }
+
+  ingress_controller = var.enable_traefik ? "traefik" : var.enable_nginx ? "nginx" : "none"
+  ingress_controller_service_names = {
+    "traefik" = "traefik"
+    "nginx"   = "ngx-ingress-nginx-controller"
+  }
+
+  ingress_controller_install_resources = {
+    "traefik" = ["traefik_config.yaml"]
+    "nginx"   = ["nginx_ingress.yaml"]
+  }
+
+  default_cilium_values = <<EOT
+ipam:
+ operator:
+  clusterPoolIPv4PodCIDRList:
+   - ${local.cluster_cidr_ipv4}
+devices: "eth1"
+  EOT
+
+  default_longhorn_values = <<EOT
+defaultSettings:
+  defaultDataPath: /var/longhorn
+persistence:
+  defaultFsType: ${var.longhorn_fstype}
+  defaultClassReplicaCount: ${var.longhorn_replica_count}
+  %{if var.disable_hetzner_csi~}defaultClass: true%{else~}defaultClass: false%{endif~}
+  EOT
+
+  default_nginx_ingress_values = <<EOT
+controller:
+  watchIngressWithoutClass: "true"
+  kind: "Deployment"
+  replicaCount: ${(local.agent_count > 2) ? 3 : (local.agent_count == 2) ? 2 : 1}
+  config:
+    "use-forwarded-headers": "true"
+    "compute-full-forwarded-for": "true"
+    "use-proxy-protocol": "true"
+  service:
+    annotations:
+      "load-balancer.hetzner.cloud/name": "${var.cluster_name}"
+      "load-balancer.hetzner.cloud/use-private-ip": "true"
+      "load-balancer.hetzner.cloud/disable-private-ingress": "true"
+      "load-balancer.hetzner.cloud/ipv6-disabled": "${var.load_balancer_disable_ipv6}"
+      "load-balancer.hetzner.cloud/location": "${var.load_balancer_location}"
+      "load-balancer.hetzner.cloud/type": "${var.load_balancer_type}"
+      "load-balancer.hetzner.cloud/uses-proxyprotocol": "true"
+  EOT
+
+  default_rancher_values = <<EOT
+hostname: "${var.rancher_hostname}"
+replicas: ${length(local.control_plane_nodes)}
+bootstrapPassword: "${length(var.rancher_bootstrap_password) == 0 ? resource.random_password.rancher_bootstrap[0].result : var.rancher_bootstrap_password}"
+  EOT
 }
+

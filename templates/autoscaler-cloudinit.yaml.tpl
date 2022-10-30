@@ -1,6 +1,12 @@
+instance-id: iid-abcde001
+
 #cloud-config
 
 debug: True
+
+bootcmd:
+# uninstall k3s if it exists already in the snaphshot
+- [/bin/sh, -c, '[ -f /usr/local/bin/k3s-uninstall.sh ] && /usr/local/bin/k3s-uninstall.sh']
 
 write_files:
 
@@ -25,17 +31,6 @@ write_files:
 - content: |
     REBOOT_METHOD=kured
   path: /etc/transactional-update.conf
-
-# Create Rancher repo config
-- content: |
-    [rancher-k3s-common-stable]
-    name=Rancher K3s Common (stable)
-    baseurl=https://rpm.rancher.io/k3s/stable/common/microos/noarch
-    enabled=1
-    gpgcheck=1
-    repo_gpgcheck=0
-    gpgkey=https://rpm.rancher.io/public.key
-  path: /etc/zypp/repos.d/rancher-k3s-common.repo
 
 # Create the sshd_t.pp file, that allows in SELinux custom SSH ports via "semodule -i",
 # the encoding is binary in base64, created on a test machine with "audit2allow -a -M sshd_t",
@@ -66,8 +61,29 @@ write_files:
     X3QBAAAAAQAAAAEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==
   path: /etc/selinux/sshd_t.pp
 
+- owner: root:root
+  path: /etc/rancher/k3s/config.yaml
+  encoding: base64
+  content: ${base64encode(k3s_config)}
 
-# Add ssh authorized keys
+- owner: root:root
+  path: /root/install-k3s-agent.sh
+  permissions: '0600'
+  content: |
+      #!/bin/sh
+      set -e
+
+      # old k3s is deleted with bootcmd
+      
+      # run installer. Not the best way to serve directly from a public server, but works for now
+      curl -sfL https://get.k3s.io | INSTALL_K3S_SKIP_START=true INSTALL_K3S_SKIP_SELINUX_RPM=true INSTALL_K3S_CHANNEL=${k3s_channel} INSTALL_K3S_EXEC=agent sh - 
+
+      # install selinux module
+      /sbin/semodule -v -i /usr/share/selinux/packages/k3s.pp
+
+# Add new authorized keys
+ssh_deletekeys: true
+
 ssh_authorized_keys:
 %{ for key in sshAuthorizedKeys ~}
   - ${key}
@@ -82,6 +98,9 @@ hostname: ${hostname}
 preserve_hostname: true
 
 runcmd:
+
+# ensure that /var uses full available disk size, thanks to btrfs this is easy
+- [btrfs, 'filesystem', 'resize', 'max', '/var']
 
 %{ if sshPort != 22 }
 # SELinux permission for the SSH alternative port.
@@ -108,3 +127,9 @@ runcmd:
 # Disables unneeded services
 - [systemctl, 'restart', 'sshd']
 - [systemctl, disable, '--now', 'rebootmgr.service']
+
+# install k3s
+- [/bin/sh, /root/install-k3s-agent.sh]
+
+# start k3s-agent service
+- [systemctl, 'start', 'k3s-agent']

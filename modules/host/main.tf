@@ -2,7 +2,7 @@ resource "random_string" "server" {
   length  = 3
   lower   = true
   special = false
-  numeric  = false
+  numeric = false
   upper   = false
 
   keepers = {
@@ -15,7 +15,7 @@ resource "random_string" "identity_file" {
   length  = 20
   lower   = true
   special = false
-  numeric  = true
+  numeric = true
   upper   = false
 }
 
@@ -35,6 +35,8 @@ resource "hcloud_server" "server" {
   # Prevent destroying the whole cluster if the user changes
   # any of the attributes that force to recreate the servers.
   lifecycle {
+    create_before_destroy = true
+
     ignore_changes = [
       location,
       ssh_keys,
@@ -47,9 +49,10 @@ resource "hcloud_server" "server" {
     private_key    = var.ssh_private_key
     agent_identity = local.ssh_agent_identity
     host           = self.ipv4_address
+    port           = var.ssh_port
   }
 
-  # Prepare ssh identity file 
+  # Prepare ssh identity file
   provisioner "local-exec" {
     command = <<-EOT
       install -b -m 600 /dev/null /tmp/${random_string.identity_file.id}
@@ -59,20 +62,37 @@ resource "hcloud_server" "server" {
 
   # Install MicroOS
   provisioner "remote-exec" {
+    connection {
+      user           = "root"
+      private_key    = var.ssh_private_key
+      agent_identity = local.ssh_agent_identity
+      host           = self.ipv4_address
+
+      # We cannot use different ports here as this runs inside Hetzner Rescue image and thus uses the
+      # standard 22 TCP port.
+      port = 22
+    }
+
     inline = [
       "set -ex",
       "apt-get update",
       "apt-get install -y aria2",
-      "aria2c --follow-metalink=mem https://download.opensuse.org/tumbleweed/appliances/openSUSE-MicroOS.x86_64-OpenStack-Cloud.qcow2.meta4",
+      "aria2c --follow-metalink=true https://download.opensuse.org/tumbleweed/appliances/openSUSE-MicroOS.x86_64-OpenStack-Cloud.qcow2.meta4",
       "qemu-img convert -p -f qcow2 -O host_device $(ls -a | grep -ie '^opensuse.*microos.*qcow2$') /dev/sda",
     ]
   }
 
-  # Issue a reboot command and wait for MicroOS to reboot and be ready
+  # Issue a reboot command.
   provisioner "local-exec" {
     command = <<-EOT
       ssh ${local.ssh_args} -i /tmp/${random_string.identity_file.id} root@${self.ipv4_address} '(sleep 2; reboot)&'; sleep 3
-      until ssh ${local.ssh_args} -i /tmp/${random_string.identity_file.id} -o ConnectTimeout=2 root@${self.ipv4_address} true 2> /dev/null
+    EOT
+  }
+
+  # Wait for MicroOS to reboot and be ready.
+  provisioner "local-exec" {
+    command = <<-EOT
+      until ssh ${local.ssh_args} -i /tmp/${random_string.identity_file.id} -o ConnectTimeout=2 -p ${var.ssh_port} root@${self.ipv4_address} true 2> /dev/null
       do
         echo "Waiting for MicroOS to reboot and become available..."
         sleep 3
@@ -82,18 +102,33 @@ resource "hcloud_server" "server" {
 
   # Install k3s-selinux (compatible version) and open-iscsi
   provisioner "remote-exec" {
+    connection {
+      user           = "root"
+      private_key    = var.ssh_private_key
+      agent_identity = local.ssh_agent_identity
+      host           = self.ipv4_address
+      port           = var.ssh_port
+    }
+
     inline = [<<-EOT
       set -ex
       transactional-update shell <<< "zypper --gpg-auto-import-keys install -y ${local.needed_packages}"
+      sleep 1 && udevadm settle
       EOT
     ]
   }
 
-  # Issue a reboot command and wait for MicroOS to reboot and be ready
+  # Issue a reboot command.
   provisioner "local-exec" {
     command = <<-EOT
-      ssh ${local.ssh_args} -i /tmp/${random_string.identity_file.id} root@${self.ipv4_address} '(sleep 2; reboot)&'; sleep 3
-      until ssh ${local.ssh_args} -i /tmp/${random_string.identity_file.id} -o ConnectTimeout=2 root@${self.ipv4_address} true 2> /dev/null
+      ssh ${local.ssh_args} -i /tmp/${random_string.identity_file.id} -p ${var.ssh_port} root@${self.ipv4_address} '(sleep 3; reboot)&'; sleep 3
+    EOT
+  }
+
+  # Wait for MicroOS to reboot and be ready
+  provisioner "local-exec" {
+    command = <<-EOT
+      until ssh ${local.ssh_args} -i /tmp/${random_string.identity_file.id} -o ConnectTimeout=2 -p ${var.ssh_port} root@${self.ipv4_address} true 2> /dev/null
       do
         echo "Waiting for MicroOS to reboot and become available..."
         sleep 3
@@ -101,7 +136,7 @@ resource "hcloud_server" "server" {
     EOT
   }
 
-  # Cleanup ssh identity file 
+  # Cleanup ssh identity file
   provisioner "local-exec" {
     command = <<-EOT
       rm /tmp/${random_string.identity_file.id}
@@ -115,6 +150,18 @@ resource "hcloud_server" "server" {
       if [[ $(systemctl list-units --all -t service --full --no-legend "iscsid.service" | sed 's/^\s*//g' | cut -f1 -d' ') == iscsid.service ]]; then
         systemctl enable --now iscsid
       fi
+      EOT
+    ]
+  }
+
+  provisioner "remote-exec" {
+    inline = var.automatically_upgrade_os ? [<<-EOT
+      echo "Automatic OS updates are enabled"
+      EOT
+      ] : [
+      <<-EOT
+      echo "Automatic OS updates are disabled"
+      systemctl --now disable transactional-update.timer
       EOT
     ]
   }
@@ -145,7 +192,9 @@ data "cloudinit_config" "config" {
       "${path.module}/templates/userdata.yaml.tpl",
       {
         hostname          = local.name
+        sshPort           = var.ssh_port
         sshAuthorizedKeys = concat([var.ssh_public_key], var.ssh_additional_public_keys)
+        dnsServers        = var.dns_servers
       }
     )
   }
