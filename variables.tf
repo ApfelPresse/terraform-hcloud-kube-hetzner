@@ -245,7 +245,7 @@ variable "cni_plugin" {
   description = "CNI plugin for k3s."
 
   validation {
-    condition     = contains(["flannel", "calico", "cilium"], var.cni_plugin)
+    condition     = contains(["flannel", "calico", "cilium", "wireguard"], var.cni_plugin)
     error_message = "The cni_plugin must be one of \"flannel\", \"calico\", or \"cilium\"."
   }
 }
