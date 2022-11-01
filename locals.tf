@@ -287,6 +287,9 @@ locals {
       disable-network-policy = true
       flannel-backend        = "none"
     }
+    "wireguard" = {
+      flannel-backend        = "wireguard"
+    }
   }
 
   ingress_controller = var.enable_traefik ? "traefik" : var.enable_nginx ? "nginx" : "none"
